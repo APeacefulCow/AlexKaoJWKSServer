@@ -3,7 +3,7 @@ import json
 
 def test_jwks():
     client = app.app.test_client()
-    res = client.get("/jwks")
+    res = client.get("/.well-known/jwks.json")
     assert res.status_code == 200
     assert "keys" in json.loads(res.data)
 

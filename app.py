@@ -1,95 +1,152 @@
 from flask import Flask, jsonify, request
 import jwt
 import datetime
-import uuid
+import sqlite3
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 
 app = Flask(__name__)
 
-# In-memory key store
-KEYS = []
+DB_FILE = "totally_not_my_privateKeys.db"
 
 
-def generate_key(expired=False):
+# --------------------------
+# Database Setup
+# --------------------------
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS keys(
+        kid INTEGER PRIMARY KEY AUTOINCREMENT,
+        key BLOB NOT NULL,
+        exp INTEGER NOT NULL
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+# --------------------------
+# Key Generation + Storage
+# --------------------------
+def generate_and_store_key(expired=False):
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
-    private_key = key.private_bytes(
+    private_pem = key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption()
     )
 
-    public_key = key.public_key().public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    if expired:
+        exp = int((datetime.datetime.utcnow() - datetime.timedelta(hours=1)).timestamp())
+    else:
+        exp = int((datetime.datetime.utcnow() + datetime.timedelta(hours=1)).timestamp())
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    # ✅ Parameterized query (prevents SQL injection)
+    cursor.execute(
+        "INSERT INTO keys (key, exp) VALUES (?, ?)",
+        (private_pem, exp)
     )
 
-    exp = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
-    if expired:
-        exp = datetime.datetime.utcnow() - datetime.timedelta(hours=1)
-
-    kid = str(uuid.uuid4())
-
-    KEYS.append({
-        "kid": kid,
-        "private": private_key,
-        "public": public_key,
-        "exp": exp
-    })
+    conn.commit()
+    conn.close()
 
 
-# Create initial keys
-generate_key(expired=False)
-generate_key(expired=True)
+# --------------------------
+# Initialize DB + Keys
+# --------------------------
+init_db()
+
+# Ensure at least one valid + one expired key
+generate_and_store_key(expired=False)
+generate_and_store_key(expired=True)
 
 
-# JWKS endpoint
-@app.route("/jwks", methods=["GET"])
+# --------------------------
+# JWKS Endpoint
+# --------------------------
+@app.route("/.well-known/jwks.json", methods=["GET"])
 def jwks():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    now = int(datetime.datetime.utcnow().timestamp())
+
+    cursor.execute(
+        "SELECT kid, key FROM keys WHERE exp > ?",
+        (now,)
+    )
+
+    rows = cursor.fetchall()
+    conn.close()
+
     keys = []
 
-    for k in KEYS:
-        if k["exp"] > datetime.datetime.utcnow():
-            pub = serialization.load_pem_public_key(k["public"])
-            numbers = pub.public_numbers()
+    for kid, private_pem in rows:
+        private_key = serialization.load_pem_private_key(private_pem, password=None)
+        public_key = private_key.public_key()
 
-            keys.append({
-                "kid": k["kid"],
-                "kty": "RSA",
-                "use": "sig",
-                "n": hex(numbers.n)[2:],
-                "e": hex(numbers.e)[2:]
-            })
+        numbers = public_key.public_numbers()
+
+        keys.append({
+            "kid": str(kid),
+            "kty": "RSA",
+            "use": "sig",
+            "n": hex(numbers.n)[2:],
+            "e": hex(numbers.e)[2:]
+        })
 
     return jsonify({"keys": keys})
 
 
-# Auth endpoint
+# --------------------------
+# Auth Endpoint
+# --------------------------
 @app.route("/auth", methods=["POST"])
 def auth():
     use_expired = request.args.get("expired") == "true"
 
-    key = None
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
 
-    for k in KEYS:
-        if use_expired and k["exp"] < datetime.datetime.utcnow():
-            key = k
-            break
-        if not use_expired and k["exp"] > datetime.datetime.utcnow():
-            key = k
-            break
+    now = int(datetime.datetime.utcnow().timestamp())
+
+    if use_expired:
+        cursor.execute(
+            "SELECT kid, key FROM keys WHERE exp < ? LIMIT 1",
+            (now,)
+        )
+    else:
+        cursor.execute(
+            "SELECT kid, key FROM keys WHERE exp > ? LIMIT 1",
+            (now,)
+        )
+
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return jsonify({"error": "No suitable key found"}), 500
+
+    kid, private_pem = row
 
     payload = {
-        "user": "test_user",
+        "user": "userABC",
         "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=30)
     }
 
     token = jwt.encode(
         payload,
-        key["private"],
+        private_pem,
         algorithm="RS256",
-        headers={"kid": key["kid"]}
+        headers={"kid": str(kid)}
     )
 
     return jsonify({"token": token})
